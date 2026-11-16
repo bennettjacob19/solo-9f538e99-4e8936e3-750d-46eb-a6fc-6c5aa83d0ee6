@@ -22,10 +22,19 @@ Rules encoded here:
   in-flight counter in one locked operation.  The returned version is the
   version the request must use, so an accepted request can never be moved to a
   different model by a swap that commits immediately afterwards.
+* A request leaves the in-flight counter in exactly one of two ways.
+  ``complete_work`` is used when the worker's answer (any HTTP response)
+  confirmed the computation is over.  ``mark_unconfirmed`` is used when the
+  API↔worker connection broke before an answer arrived: the request moves to
+  the slot's *unconfirmed* set and **keeps occupying the slot**, because the
+  model process may still be computing it.  Unconfirmed entries are settled
+  by reconciliation against the worker's own in-flight table
+  (``reconcile_unconfirmed``) or, once the OS process is definitely gone, by
+  ``settle_dead_worker``.  The drain gate uses ``in_flight + unconfirmed``.
 * ``commit_swap`` atomically promotes the tested candidate and moves the old
   version to ``draining``.  The old process is stopped only by the drain
-  coordinator after ``in_flight == 0``; only after the OS process exits is
-  ``release_slot`` allowed.
+  coordinator after ``in_flight == 0`` and ``unconfirmed == 0``; only after
+  the OS process exits is ``release_slot`` allowed.
 * ``begin_swap`` claims a swap *keyed by the old active version*.  A second
   swap claiming the same old version while the first is still in progress is
   rejected before any process is started.  The API runs as a single process
@@ -99,8 +108,11 @@ class Registry:
                 "process_state": STATE_IDLE,
                 "pid": None,
                 "in_flight": 0,
+                "unconfirmed": 0,
+                "unconfirmed_ids": [],
                 "accepted": 0,
                 "completed": 0,
+                "next_seq": 1,
                 "started_at": None,
                 "idle_since": now,
                 "generation": 0,
@@ -142,6 +154,21 @@ class Registry:
             if slot is None or slot["version"] != version:
                 return 0
             return int(slot["in_flight"])
+
+    def version_outstanding(self, version: str) -> int:
+        """In-flight plus unconfirmed work still charged to the version.
+
+        This is the drain gate: a slot stays occupied until every request it
+        accepted is *confirmed* finished (or its process is confirmed gone).
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return 0
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version:
+                return 0
+            return int(slot["in_flight"]) + int(slot["unconfirmed"])
 
     def has_capacity(self) -> bool:
         with self._lock:
@@ -225,8 +252,11 @@ class Registry:
                 process_state=STATE_LOADING,
                 pid=None,
                 in_flight=0,
+                unconfirmed=0,
+                unconfirmed_ids=[],
                 accepted=0,
                 completed=0,
+                next_seq=1,
                 started_at=now,
                 idle_since=None,
                 generation=slot["generation"] + 1,
@@ -304,6 +334,8 @@ class Registry:
                     process_state=STATE_IDLE,
                     pid=None,
                     in_flight=0,
+                    unconfirmed=0,
+                    unconfirmed_ids=[],
                     idle_since=time.time(),
                 )
                 self._slots[info["slot_id"]] = slot
@@ -358,12 +390,17 @@ class Registry:
             self._state["active_version"] = version
             del self._claims[key]
 
-    def accept_work(self, n_features: Optional[int] = None) -> Tuple[str, str]:
+    def accept_work(self, n_features: Optional[int] = None) -> Tuple[str, str, int]:
         """Pin an inference to the active version and count it in-flight.
 
         With ``n_features`` the request is validated against the active
         version's input width inside the same critical section, so a rejected
         request never touches the in-flight counter.
+
+        Returns ``(version, slot_id, seq)`` where ``seq`` is a per-slot
+        monotonically increasing request number.  The API forwards it to the
+        worker so the worker's own in-flight table can be reconciled against
+        the registry's after a connection break.
         """
         with self._lock:
             version = self._state["active_version"]
@@ -391,12 +428,20 @@ class Registry:
             ):
                 raise NoActiveModel("active slot is inconsistent")
             slot = dict(slot)
+            seq = int(slot.get("next_seq", 1))
+            slot["next_seq"] = seq + 1
             slot["in_flight"] += 1
             slot["accepted"] += 1
             self._slots[info["slot_id"]] = slot
-            return version, info["slot_id"]
+            return version, info["slot_id"], seq
 
     def complete_work(self, version: str) -> None:
+        """Confirm one in-flight request as finished (worker answered).
+
+        A no-op when the slot no longer counts the request (e.g. a dead
+        worker was already settled), so a late confirmation can never
+        double-count or corrupt a successor's counters.
+        """
         with self._lock:
             info = self._versions.get(version)
             if info is None:
@@ -404,16 +449,99 @@ class Registry:
             slot = self._slots.get(info["slot_id"])
             if slot is None or slot["version"] != version:
                 return
+            if slot["in_flight"] <= 0:
+                return
             slot = dict(slot)
-            slot["in_flight"] = max(0, slot["in_flight"] - 1)
+            slot["in_flight"] -= 1
             slot["completed"] += 1
             self._slots[info["slot_id"]] = slot
+
+    def mark_unconfirmed(self, version: str, request_id: str, seq: int) -> bool:
+        """Move one in-flight request to the *unconfirmed* set.
+
+        Used when the API↔worker connection broke before any response
+        arrived: the request's fate is unknown, the model process may still
+        be computing it, so it keeps occupying the slot until reconciliation
+        or process exit settles it.  Returns False (no-op) if the slot no
+        longer belongs to ``version`` or the request was already settled —
+        a late mark can never disturb a successor generation.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return False
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version:
+                return False
+            if slot["in_flight"] <= 0:
+                return False
+            slot = dict(slot)
+            entries = list(slot.get("unconfirmed_ids", []))
+            entries.append(
+                {"id": request_id, "seq": int(seq), "since": time.time()}
+            )
+            slot["unconfirmed_ids"] = entries
+            slot["unconfirmed"] = len(entries)
+            slot["in_flight"] -= 1
+            self._slots[info["slot_id"]] = slot
+            return True
+
+    def reconcile_unconfirmed(
+        self,
+        version: str,
+        running_ids: Any,
+        grace_seconds: float,
+        now: Optional[float] = None,
+    ) -> Dict[str, int]:
+        """Settle unconfirmed requests against the worker's in-flight table.
+
+        ``running_ids`` are the request ids the *worker* reports as still
+        computing.  An unconfirmed entry found there stays charged to the
+        slot.  An entry missing from the worker's table is confirmed finished
+        (or never received) once it is older than ``grace_seconds`` — the
+        grace covers the tiny window in which a delivered request has not
+        been registered by the worker yet.  Confirmation moves the entry to
+        ``completed`` exactly once; entries are never double counted because
+        only entries still present in ``unconfirmed_ids`` are touched.
+        """
+        if now is None:
+            now = time.time()
+        running = set(running_ids or ())
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return {"confirmed": 0, "still_unconfirmed": 0}
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version:
+                return {"confirmed": 0, "still_unconfirmed": 0}
+            entries = list(slot.get("unconfirmed_ids", []))
+            if not entries:
+                return {"confirmed": 0, "still_unconfirmed": 0}
+            keep = []
+            confirmed = 0
+            for entry in entries:
+                if entry["id"] in running:
+                    keep.append(entry)
+                elif now - float(entry["since"]) < grace_seconds:
+                    keep.append(entry)
+                else:
+                    confirmed += 1
+            if confirmed == 0 and len(keep) == len(entries):
+                return {"confirmed": 0, "still_unconfirmed": len(keep)}
+            slot = dict(slot)
+            slot["unconfirmed_ids"] = keep
+            slot["unconfirmed"] = len(keep)
+            slot["completed"] += confirmed
+            self._slots[info["slot_id"]] = slot
+            return {"confirmed": confirmed, "still_unconfirmed": len(keep)}
 
     def release_slot(self, slot_id: str, version: str, process_exited: bool) -> bool:
         """Free a drained slot.
 
         ``process_exited`` must be True: slot reuse is gated on the OS process
-        actually being gone, not on the API's intent to stop it.
+        actually being gone, not on the API's intent to stop it.  The slot
+        must also have no in-flight *and* no unconfirmed work: a connection
+        break is not proof that the computation ended.
         """
         if not process_exited:
             return False
@@ -421,7 +549,7 @@ class Registry:
             slot = self._slots.get(slot_id)
             if slot is None or slot["version"] != version:
                 return False
-            if slot["in_flight"] != 0:
+            if slot["in_flight"] != 0 or slot["unconfirmed"] != 0:
                 return False
             if slot["process_state"] not in (STATE_DRAINING, STATE_LOADING):
                 return False
@@ -443,16 +571,22 @@ class Registry:
     def fail_active(self, version: str, error: str) -> bool:
         """Take a crashed active version out of service and free its slot.
 
-        Used when the worker process dies unexpectedly.  Refuses while work is
-        still counted in-flight (those requests will fail on their own and
-        decrement the counter), and never touches a different active version.
+        Used when the worker process dies unexpectedly.  Refuses while work
+        is still counted in-flight or unconfirmed (those requests are settled
+        first via ``settle_dead_worker`` once the process is known to be
+        gone), and never touches a different active version.
         """
         with self._lock:
             info = self._versions.get(version)
             if info is None or info["state"] != VERSION_ACTIVE:
                 return False
             slot = self._slots.get(info["slot_id"])
-            if slot is None or slot["version"] != version or slot["in_flight"] != 0:
+            if (
+                slot is None
+                or slot["version"] != version
+                or slot["in_flight"] != 0
+                or slot["unconfirmed"] != 0
+            ):
                 return False
             info = dict(info)
             info.update(state=VERSION_FAILED, error=error, retired_at=time.time())
@@ -463,6 +597,8 @@ class Registry:
                 process_state=STATE_IDLE,
                 pid=None,
                 in_flight=0,
+                unconfirmed=0,
+                unconfirmed_ids=[],
                 idle_since=time.time(),
             )
             self._slots[info["slot_id"]] = slot
@@ -471,11 +607,12 @@ class Registry:
             return True
 
     def settle_dead_worker(self, version: str) -> bool:
-        """If a worker died mid-request, stop counting its in-flight work.
+        """If a worker died mid-request, stop counting its unfinished work.
 
-        Called by the drain/reaper loop once the OS process is gone: the
-        corresponding HTTP calls have failed or will fail, so keeping the
-        counter raised would wedge the slot forever.
+        Called by the drain/reaper loop once the OS process is gone: with no
+        process there is nothing left that could still be computing, so both
+        in-flight and unconfirmed (connection lost, fate unknown) requests
+        are settled instead of wedging the slot forever.
         """
         with self._lock:
             info = self._versions.get(version)
@@ -484,11 +621,14 @@ class Registry:
             slot = self._slots.get(info["slot_id"])
             if slot is None or slot["version"] != version:
                 return False
-            if slot["in_flight"] == 0:
+            outstanding = int(slot["in_flight"]) + int(slot["unconfirmed"])
+            if outstanding == 0:
                 return False
             slot = dict(slot)
-            slot["completed"] += slot["in_flight"]
+            slot["completed"] += outstanding
             slot["in_flight"] = 0
+            slot["unconfirmed"] = 0
+            slot["unconfirmed_ids"] = []
             self._slots[info["slot_id"]] = slot
             return True
 

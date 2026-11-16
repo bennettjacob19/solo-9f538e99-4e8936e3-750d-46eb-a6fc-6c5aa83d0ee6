@@ -117,10 +117,12 @@ def upload(api: ApiServer, payload, timeout=40.0):
     return httpx.post(f"{api.base}/admin/models", json=payload, timeout=timeout)
 
 
-def infer(api: ApiServer, features, timeout_ms=None, slow_ms=0, timeout=40.0):
+def infer(api: ApiServer, features, timeout_ms=None, slow_ms=0, timeout=40.0, drop_response=False):
     body = {"features": features, "slow_ms": slow_ms}
     if timeout_ms is not None:
         body["timeout_ms"] = timeout_ms
+    if drop_response:
+        body["drop_response"] = True
     return httpx.post(f"{api.base}/infer", json=body, timeout=timeout)
 
 
@@ -279,6 +281,71 @@ def test_07_third_version_loads_after_release(api):
     in_use = [s for s in st["slots"] if s["process_state"] != "idle"]
     assert len(in_use) == 2  # v4 active + v3 draining
     assert infer(api, [0.9, 0.1]).json()["version"] == "v4"
+
+
+def test_07b_connection_break_keeps_slot_until_worker_confirms(api):
+    """The QA scenario: the API↔worker response connection breaks mid-inference.
+
+    The caller gets 502, but the request is *not* cleared: it occupies its
+    slot as unconfirmed, the old process is not stopped early, a swap uses
+    the other slot, a third version is refused, and once the worker finishes
+    the reconciliation confirms it and the slot is released.
+    """
+    wait_for(lambda: status(api)["slots_in_use"] == 1)
+    assert status(api)["active_version"] == "v4"
+
+    # The worker accepts, breaks the response connection, keeps computing 6s.
+    resp = infer(api, [0.9, 0.1], slow_ms=6000, drop_response=True)
+    assert resp.status_code == 502, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "worker_connection_lost"
+    assert detail["version"] == "v4"
+
+    # Only the caller's wait ended: the request is unconfirmed, not finished.
+    st = status(api)
+    assert st["total_in_flight"] == 0
+    assert st["total_unconfirmed"] == 1
+    assert st["active_version"] == "v4"
+
+    # The current version keeps serving.
+    assert infer(api, [0.9, 0.1]).json()["version"] == "v4"
+
+    # The swap commits on the other slot; v4 drains but stays occupied.
+    resp2 = upload(api, artifact("v5", W_A, [0.0, 0.0], LABELS))
+    assert resp2.status_code == 201, resp2.text
+    st = status(api)
+    assert st["active_version"] == "v5"
+    slots = {s["version"]: s for s in st["slots"] if s["version"]}
+    assert slots["v4"]["process_state"] == "draining"
+    assert slots["v4"]["unconfirmed"] == 1
+    assert slots["v4"]["alive"] is True  # old process NOT stopped early
+    assert st["slots_in_use"] == 2
+
+    # A third version is refused while the unconfirmed work may still run.
+    resp3 = upload(api, artifact("v6", W_B, [0.0, 0.0], LABELS))
+    assert resp3.status_code == 429, resp3.text
+    assert resp3.json()["detail"]["error"] == "capacity_exhausted"
+    assert status(api)["active_version"] == "v5"
+
+    # New traffic goes to the new version immediately.
+    assert infer(api, [0.9, 0.1]).json()["version"] == "v5"
+
+    # The worker finishes the 6s computation; the reconcile loop confirms it
+    # against the worker's own in-flight table and the slot is released.
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=20)
+    st = status(api)
+    assert st["total_unconfirmed"] == 0
+    assert st["total_in_flight"] == 0
+    v4 = next(v for v in st["versions"] if v["version"] == "v4")
+    assert v4["state"] == "retired"
+    assert v4["process_state"] == "idle"
+    # No request was lost or double counted anywhere.
+    assert st["total_accepted"] == st["total_completed"]
+
+    # The freed slot takes the previously refused third version.
+    resp4 = upload(api, artifact("v6", W_B, [0.0, 0.0], LABELS))
+    assert resp4.status_code == 201, resp4.text
+    assert status(api)["active_version"] == "v6"
 
 
 def test_08_concurrent_swaps_one_winner(api):

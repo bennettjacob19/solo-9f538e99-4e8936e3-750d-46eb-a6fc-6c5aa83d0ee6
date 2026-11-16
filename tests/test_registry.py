@@ -38,8 +38,11 @@ def registry(manager):
             "process_state": "idle",
             "pid": None,
             "in_flight": 0,
+            "unconfirmed": 0,
+            "unconfirmed_ids": [],
             "accepted": 0,
             "completed": 0,
+            "next_seq": 1,
             "started_at": None,
             "idle_since": 0.0,
             "generation": reg._slots[slot]["generation"],
@@ -87,7 +90,7 @@ def test_second_swap_retires_old_but_keeps_slot_until_drained(registry):
 
     slot = registry.version_info("v1")["slot_id"]
     # In-flight work blocks release.
-    version, _ = registry.accept_work()
+    version, _, _ = registry.accept_work()
     assert version == "v2"
     assert registry.release_slot(slot, "v1", process_exited=True) is True  # no in-flight on v1
     registry.complete_work("v2")
@@ -175,14 +178,18 @@ def test_duplicate_live_version_rejected(registry):
 def test_accepted_work_is_pinned_to_active_version(registry):
     _load(registry, "v1")
     _activate(registry, "v1")
-    version, slot = registry.accept_work()
+    version, slot, seq = registry.accept_work()
     assert (version, slot) == ("v1", "slot-0")
+    assert seq == 1
+    _, _, seq2 = registry.accept_work()
+    assert seq2 == 2  # per-slot monotonic request numbers
 
     _load(registry, "v2")
     _activate(registry, "v2", old="v1")
     # The pre-existing in-flight count belongs to v1, not the new active.
-    assert registry.version_in_flight("v1") == 1
+    assert registry.version_in_flight("v1") == 2
     assert registry.version_in_flight("v2") == 0
+    registry.complete_work("v1")
     registry.complete_work("v1")
     assert registry.version_in_flight("v1") == 0
 
@@ -194,7 +201,7 @@ def test_feature_mismatch_does_not_count_in_flight(registry):
     with pytest.raises(FeatureMismatch):
         registry.accept_work(2)
     assert registry.version_in_flight("v1") == 0
-    version, _ = registry.accept_work(3)
+    version, _, _ = registry.accept_work(3)
     assert version == "v1"
 
 
@@ -212,3 +219,133 @@ def test_dead_active_worker_releases_slot(registry):
     assert registry.active_version() is None
     assert registry.has_capacity()
     assert registry.version_info("v1")["state"] == VERSION_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Connection-break / unconfirmed-request lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _slot(registry, version):
+    info = registry.version_info(version)
+    return next(s for s in registry.snapshot()["slots"] if s["slot_id"] == info["slot_id"])
+
+
+def test_connection_break_moves_request_to_unconfirmed_and_blocks_release(registry):
+    _load(registry, "v1")
+    _activate(registry, "v1")
+    _, slot_id, seq = registry.accept_work()
+
+    assert registry.mark_unconfirmed("v1", "req-1", seq) is True
+    slot = _slot(registry, "v1")
+    assert slot["in_flight"] == 0
+    assert slot["unconfirmed"] == 1
+    # Still occupies the slot: the drain gate and the release gate both hold.
+    assert registry.version_outstanding("v1") == 1
+    assert registry.release_slot(slot_id, "v1", process_exited=True) is False
+
+    # Reconciliation: worker still lists the request -> nothing changes.
+    out = registry.reconcile_unconfirmed("v1", ["req-1"], grace_seconds=0.0)
+    assert out == {"confirmed": 0, "still_unconfirmed": 1}
+    assert registry.version_outstanding("v1") == 1
+
+    # Worker no longer lists it, but the entry is younger than the grace.
+    out = registry.reconcile_unconfirmed("v1", [], grace_seconds=3600.0)
+    assert out == {"confirmed": 0, "still_unconfirmed": 1}
+
+    # Past the grace and absent from the worker's table -> confirmed finished.
+    out = registry.reconcile_unconfirmed("v1", [], grace_seconds=0.0)
+    assert out == {"confirmed": 1, "still_unconfirmed": 0}
+    slot = _slot(registry, "v1")
+    assert slot["unconfirmed"] == 0
+    assert slot["completed"] == 1
+    assert registry.version_outstanding("v1") == 0
+
+
+def test_unconfirmed_work_blocks_third_version_until_confirmed(registry):
+    _load(registry, "v1")
+    _activate(registry, "v1")
+    _, _, seq = registry.accept_work()
+    registry.mark_unconfirmed("v1", "req-1", seq)
+
+    _load(registry, "v2")
+    _activate(registry, "v2", old="v1")  # swap uses the other slot, v1 drains
+    with pytest.raises(NoCapacity):
+        registry.reserve_any_slot("v3")  # third version refused
+
+    # The broken-connection request is confirmed only when the worker
+    # stops listing it; then the drained slot can be released.
+    registry.reconcile_unconfirmed("v1", [], grace_seconds=0.0)
+    assert registry.release_slot("slot-0", "v1", process_exited=True) is True
+    assert registry.has_capacity()
+
+
+def test_dead_worker_settles_unconfirmed_without_double_count(registry):
+    _load(registry, "v1")
+    _activate(registry, "v1")
+    registry.accept_work()
+    _, _, seq2 = registry.accept_work()
+    registry.mark_unconfirmed("v1", "req-2", seq2)
+    slot = _slot(registry, "v1")
+    assert (slot["in_flight"], slot["unconfirmed"]) == (1, 1)
+
+    # Process died: both the healthy in-flight and the unconfirmed request
+    # are settled exactly once.
+    assert registry.settle_dead_worker("v1") is True
+    slot = _slot(registry, "v1")
+    assert (slot["in_flight"], slot["unconfirmed"], slot["completed"]) == (0, 0, 2)
+    assert registry.settle_dead_worker("v1") is False  # nothing left to settle
+
+    # Late completions/marks for the settled requests are no-ops.
+    registry.complete_work("v1")
+    assert registry.mark_unconfirmed("v1", "req-1", 1) is False
+    slot = _slot(registry, "v1")
+    assert slot["completed"] == 2
+    assert registry.fail_active("v1", "crashed") is True
+
+
+def test_late_confirmation_cannot_touch_successor_generation(registry):
+    _load(registry, "v1")
+    _activate(registry, "v1")
+    _, _, seq = registry.accept_work()
+    registry.mark_unconfirmed("v1", "req-old", seq)
+    registry.settle_dead_worker("v1")
+    assert registry.fail_active("v1", "crashed") is True
+
+    # The freed slot is reused by a new version.
+    _load(registry, "v2")
+    _activate(registry, "v2")
+    registry.accept_work()  # one in-flight on the successor
+
+    # Late bookkeeping for the old generation must not leak into the new one.
+    assert registry.mark_unconfirmed("v1", "req-old", seq) is False
+    registry.complete_work("v1")
+    out = registry.reconcile_unconfirmed("v1", [], grace_seconds=0.0)
+    assert out == {"confirmed": 0, "still_unconfirmed": 0}
+    slot = _slot(registry, "v2")
+    assert (slot["in_flight"], slot["unconfirmed"], slot["completed"]) == (1, 0, 0)
+
+
+def test_slot_counters_stay_consistent(registry):
+    """accepted == completed + in_flight + unconfirmed at every step."""
+    _load(registry, "v1")
+    _activate(registry, "v1")
+
+    def check():
+        slot = _slot(registry, "v1")
+        assert slot["accepted"] == (
+            slot["completed"] + slot["in_flight"] + slot["unconfirmed"]
+        )
+
+    _, _, seq1 = registry.accept_work()
+    check()
+    _, _, seq2 = registry.accept_work()
+    check()
+    registry.mark_unconfirmed("v1", "req-2", seq2)
+    check()
+    registry.complete_work("v1")
+    check()
+    registry.reconcile_unconfirmed("v1", [], grace_seconds=0.0)
+    check()
+    slot = _slot(registry, "v1")
+    assert slot["accepted"] == slot["completed"] == 2

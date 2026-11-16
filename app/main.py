@@ -12,7 +12,10 @@ The invariants live in ``app/process_manager.py``.  In short: every model
 version runs in its own OS process, at most two such processes exist at once,
 requests are pinned to the version active at admission, and a retired version
 only releases its slot once every inference it actually accepted has finished
-inside its worker -- regardless of whether the client is still waiting.
+inside its worker -- regardless of whether the client is still waiting.  A
+broken API↔worker connection is not treated as completion either: the request
+becomes *unconfirmed* and keeps its slot until the worker's own in-flight
+table (or the process's exit) settles it.
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ from app.process_manager import (
     SwapConflict,
     WorkerHandle,
 )
+from app.worker import REQUEST_ID_HEADER, SEQ_HEADER
 
 logger = logging.getLogger("qc.service")
 logging.basicConfig(
@@ -66,6 +70,11 @@ MAX_TIMEOUT_MS = 600_000
 SWAP_WAIT_SECONDS = float(os.environ.get("SWAP_WAIT_SECONDS", "3"))
 # How long shutdown waits for accepted inference to finish before killing workers.
 SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
+# After an API↔worker connection break, an unconfirmed request that the
+# worker does not list as running is only confirmed finished once it is at
+# least this old.  The grace covers the (sub-millisecond on loopback) window
+# in which a delivered request has not been registered by the worker yet.
+UNCONFIRMED_GRACE_SECONDS = float(os.environ.get("UNCONFIRMED_GRACE_SECONDS", "1.0"))
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +110,16 @@ class InferRequest(BaseModel):
             "Demo hook: ask the model process to spend this long on the computation "
             "before scoring. Use with a small timeout_ms to demonstrate the 504 / "
             "drain behaviour."
+        ),
+    )
+    drop_response: bool = Field(
+        False,
+        description=(
+            "Demo hook: the model process accepts the request, then breaks the "
+            "API↔worker response connection immediately while the computation "
+            "(slow_ms) continues to completion inside the worker. The API "
+            "answers 502 (worker_connection_lost) and the request keeps its "
+            "slot as 'unconfirmed' until the worker confirms it finished."
         ),
     )
 
@@ -159,6 +178,7 @@ class SlotView(BaseModel):
     process_state: str
     pid: Optional[int]
     in_flight: int
+    unconfirmed: int
     accepted: int
     completed: int
     alive: Optional[bool]
@@ -168,6 +188,7 @@ class StatusView(BaseModel):
     active_version: Optional[str]
     version: Optional[str]
     total_in_flight: int
+    total_unconfirmed: int
     total_accepted: int
     total_completed: int
     slots_in_use: int
@@ -556,6 +577,9 @@ class InferenceService:
 
     async def drain_once(self) -> None:
         snapshot = self.registry.snapshot()
+        slots_by_version = {
+            s["version"]: s for s in snapshot["slots"] if s["version"] is not None
+        }
         for version, info in snapshot["versions"].items():
             handle = self.handles.get(version)
             # Unexpected worker death: a crashed worker cannot be part of the
@@ -563,22 +587,30 @@ class InferenceService:
             # so the machine does not appear full forever.
             if handle is not None and not handle.alive():
                 self._reap_dead_worker(version, info)
+                handle = None
+
+            # Settle requests whose API↔worker connection broke.  While the
+            # worker lives, its own in-flight table decides what is really
+            # still running; once the process is gone nothing can be running.
+            slot = slots_by_version.get(version)
+            if slot is not None and int(slot.get("unconfirmed", 0)) > 0:
+                if handle is None:
+                    self.registry.settle_dead_worker(version)
+                else:
+                    await self._reconcile_unconfirmed(version, handle)
 
             if info["state"] not in (VERSION_RETIRED, VERSION_FAILED):
                 continue
             if info["process_state"] not in (STATE_DRAINING, STATE_IDLE):
                 continue
-            slot = next(
-                (s for s in snapshot["slots"] if s["slot_id"] == info["slot_id"]),
-                None,
-            )
             if slot is None or slot["version"] != version:
                 continue
             if version in self._draining:
                 continue
             # The drain gate: only stop the process once no accepted request
-            # is still running inside it.
-            if self.registry.version_in_flight(version) > 0:
+            # is still running inside it — including requests whose connection
+            # broke before their completion could be confirmed.
+            if self.registry.version_outstanding(version) > 0:
                 continue
             self._draining.add(version)
             try:
@@ -596,6 +628,36 @@ class InferenceService:
             finally:
                 self._draining.discard(version)
 
+    async def _reconcile_unconfirmed(self, version: str, handle: WorkerHandle) -> None:
+        """Confirm connection-broken requests against the worker's own table.
+
+        The worker lists the requests it is still computing; anything it no
+        longer lists (and that is older than the registration grace) is
+        confirmed finished and stops occupying the slot.  If the worker cannot
+        be reached the entries stay unconfirmed — the slot remains occupied
+        rather than risking a premature drain.
+        """
+        try:
+            assert self.client is not None
+            resp = await self.client.get(handle.status_url(), timeout=1.5)
+            if resp.status_code != 200:
+                return
+            running_ids = [
+                entry["request_id"] for entry in resp.json().get("in_flight_requests", [])
+            ]
+        except Exception:
+            return  # link still down; keep the slot occupied
+        result = self.registry.reconcile_unconfirmed(
+            version, running_ids, UNCONFIRMED_GRACE_SECONDS
+        )
+        if result["confirmed"]:
+            logger.info(
+                "reconciled %d unconfirmed request(s) on %s (%d still running)",
+                result["confirmed"],
+                version,
+                result["still_unconfirmed"],
+            )
+
     def _reap_dead_worker(self, version: str, info: Dict[str, Any]) -> None:
         """Reclaim bookkeeping for a worker process that died unexpectedly."""
         self.handles.pop(version, None)
@@ -610,10 +672,14 @@ class InferenceService:
 
     # -- inference -------------------------------------------------------
     async def infer(
-        self, features: List[float], timeout_ms: int, slow_ms: int = 0
+        self,
+        features: List[float],
+        timeout_ms: int,
+        slow_ms: int = 0,
+        drop_response: bool = False,
     ) -> InferResponse:
         try:
-            version, _slot_id = self.registry.accept_work(len(features))
+            version, _slot_id, seq = self.registry.accept_work(len(features))
         except FeatureMismatch as exc:
             raise HTTPException(
                 status_code=422,
@@ -642,12 +708,16 @@ class InferenceService:
         payload: Dict[str, Any] = {"features": features}
         if slow_ms:
             payload["slow_ms"] = slow_ms
+        if drop_response:
+            payload["drop_response"] = True
         inference_id = uuid.uuid4().hex
 
         # Shield the worker call from this request's timeout/cancellation.  The
         # in-flight counter must only clear when the model process is actually
         # done; a 504 or disconnected client must not fake completion.
-        task = asyncio.create_task(self._proxy_inference(version, handle, payload))
+        task = asyncio.create_task(
+            self._proxy_inference(version, handle, payload, inference_id, seq)
+        )
         self._background.add(task)
         task.add_done_callback(self._background.discard)
 
@@ -677,12 +747,24 @@ class InferenceService:
                 },
             )
         except httpx.HTTPError as exc:
+            # The API↔worker connection broke before an answer arrived.  Only
+            # the caller's wait ends here: the request stays charged to the
+            # model's slot as *unconfirmed* until the worker (or its exit)
+            # confirms the computation is over.
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "error": "worker_unreachable",
+                    "error": "worker_connection_lost",
                     "version": version,
                     "message": str(exc),
+                    "request_id": inference_id,
+                    "note": (
+                        "The connection to the model process broke before a "
+                        "response was confirmed. The inference may still be "
+                        "running; it keeps occupying its slot (unconfirmed) "
+                        "until the worker confirms completion or the process "
+                        "exits."
+                    ),
                 },
             ) from exc
         except RuntimeError as exc:
@@ -701,26 +783,45 @@ class InferenceService:
         )
 
     async def _proxy_inference(
-        self, version: str, handle: WorkerHandle, payload: Dict[str, Any]
+        self,
+        version: str,
+        handle: WorkerHandle,
+        payload: Dict[str, Any],
+        request_id: str,
+        seq: int,
     ) -> Dict[str, Any]:
+        headers = {
+            REQUEST_ID_HEADER: request_id,
+            SEQ_HEADER: str(seq),
+        }
         try:
             assert self.client is not None
-            resp = await self.client.post(handle.inference_url(), json=payload)
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"worker {version} returned HTTP {resp.status_code}: {resp.text[:300]}"
-                )
-            return resp.json()
-        finally:
-            # Runs once, when the worker call actually settles.  This is the
-            # only place a request leaves the drain gate.
-            self.registry.complete_work(version)
+            resp = await self.client.post(
+                handle.inference_url(), json=payload, headers=headers
+            )
+        except (httpx.HTTPError, asyncio.CancelledError):
+            # No response arrived, so nothing is confirmed: the request may
+            # still be computing inside the model process.  Move it to the
+            # unconfirmed set — it keeps its slot until reconciliation or
+            # process exit settles it.  This is the only place a request
+            # leaves the confirmed in-flight counter without an answer.
+            self.registry.mark_unconfirmed(version, request_id, seq)
+            raise
+        # Any HTTP response (even an error status) proves the worker finished
+        # processing the request: confirmed complete.
+        self.registry.complete_work(version)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"worker {version} returned HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        return resp.json()
 
     # -- status ----------------------------------------------------------
     def status(self) -> StatusView:
         snapshot = self.registry.snapshot()
         slots: List[SlotView] = []
         total_in_flight = 0
+        total_unconfirmed = 0
         total_accepted = 0
         total_completed = 0
         active = snapshot["active_version"]
@@ -728,6 +829,7 @@ class InferenceService:
             handle = self.handles.get(slot["version"]) if slot["version"] else None
             alive = handle.alive() if handle is not None else None
             total_in_flight += int(slot["in_flight"])
+            total_unconfirmed += int(slot["unconfirmed"])
             total_accepted += int(slot["accepted"])
             total_completed += int(slot["completed"])
             slots.append(
@@ -737,6 +839,7 @@ class InferenceService:
                     process_state=slot["process_state"],
                     pid=slot["pid"],
                     in_flight=int(slot["in_flight"]),
+                    unconfirmed=int(slot["unconfirmed"]),
                     accepted=int(slot["accepted"]),
                     completed=int(slot["completed"]),
                     alive=alive,
@@ -746,6 +849,7 @@ class InferenceService:
             active_version=active,
             version=active,
             total_in_flight=total_in_flight,
+            total_unconfirmed=total_unconfirmed,
             total_accepted=total_accepted,
             total_completed=total_completed,
             slots_in_use=snapshot["slots_in_use"],
@@ -790,7 +894,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Edge QC Classifier Inference Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Linear classifier inference with live model replacement on an edge QC "
         "machine that can host at most **two model processes**.\n\n"
@@ -802,12 +906,23 @@ app = FastAPI(
         "are pinned to the version active when accepted. `timeout_ms` (or "
         "`timeout_seconds`) bounds the *client wait only*: on expiry you get 504 "
         "while the worker keeps working and keeps its slot.\n"
-        "* `GET /admin/status` shows the active version, in-flight counts and each "
-        "process slot's state (`loading` / `active` / `draining` / `idle`).\n\n"
+        "* If the API↔worker connection breaks mid-inference you get 502 "
+        "(`worker_connection_lost`); the request is **not** assumed finished — "
+        "it keeps its slot as *unconfirmed* until the worker's own in-flight "
+        "table confirms it (or the process exits).\n"
+        "* `GET /admin/status` shows the active version, per-slot `in_flight` "
+        "(confirmed running) vs `unconfirmed` (connection lost, completion "
+        "pending confirmation) counts, and each process slot's state "
+        "(`loading` / `active` / `draining` / `idle`).\n\n"
         "**Demos**\n"
         "- Slow inference: `POST /infer` with `slow_ms: 3000`, `timeout_ms: 200`, "
         "then watch `/admin/status` and try uploading another version: while the "
         "drained version still works, only one slot is free.\n"
+        "- Connection break: `POST /infer` with `slow_ms: 8000`, "
+        "`drop_response: true`. You get 502 immediately, the worker keeps "
+        "computing, `/admin/status` shows `unconfirmed: 1`, a swap uses the "
+        "other slot, a third upload is refused (429), and once the computation "
+        "ends the reconciliation confirms it and releases the slot.\n"
         "- Load failure: upload with `simulate_load_failure: true` (or malformed "
         "weights). You get 502 and the old version remains active.\n"
         "- Capacity: trigger a slow in-flight request, swap once, then try a third "
@@ -832,7 +947,14 @@ def healthz() -> Dict[str, Any]:
             "description": "Client timeout; the worker keeps computing and holds its slot.",
         },
         503: {"description": "No active model"},
-        502: {"description": "Worker unreachable or errored"},
+        502: {
+            "description": (
+                "Worker errored, or the API↔worker connection broke "
+                "(worker_connection_lost): the caller's wait ends, but the "
+                "request keeps its slot as unconfirmed until the worker "
+                "confirms it finished or the process exits."
+            )
+        },
     },
     tags=["inference"],
     summary="Classify a feature vector",
@@ -844,7 +966,7 @@ async def infer(req: InferRequest) -> InferResponse:
         timeout_ms = max(1, int(round(req.timeout_seconds * 1000)))
     else:
         timeout_ms = DEFAULT_TIMEOUT_MS
-    return await service.infer(req.features, timeout_ms, req.slow_ms)
+    return await service.infer(req.features, timeout_ms, req.slow_ms, req.drop_response)
 
 
 @app.post(

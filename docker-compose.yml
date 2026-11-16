@@ -12,6 +12,9 @@ services:
       # before the upload is refused with 429.
       SWAP_WAIT_SECONDS: "3"
       SHUTDOWN_GRACE_SECONDS: "20"
+      # Registration grace for confirming connection-broken requests that the
+      # worker no longer lists as running.
+      UNCONFIRMED_GRACE_SECONDS: "1"
       LOG_LEVEL: INFO
       # Optional: load an existing artifact at startup.
       # BOOTSTRAP_VERSION: v1

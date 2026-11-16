@@ -100,10 +100,25 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
   shielded from the request timeout/cancellation, and the in-flight counter is
   decremented when the worker actually returns. A disconnected client behaves
   the same way.
+* **A broken API↔worker connection is not completion either.** If the
+  response connection to the model process breaks mid-inference, the caller
+  gets 502 (`worker_connection_lost`) — but the request is *not* cleared.
+  It moves to the slot's **unconfirmed** set and keeps occupying the slot,
+  because the model process may still be computing it. The API tags every
+  request with an id (`x-qc-request-id`) that the worker registers in its own
+  in-flight table before dispatch; a reconcile loop polls the worker's
+  `/status` and confirms exactly those requests the worker no longer lists
+  (after a small registration grace, `UNCONFIRMED_GRACE_SECONDS`). Requests
+  the worker still lists keep their slot. If the worker *process* has exited,
+  nothing can still be computing and the entries are reclaimed immediately.
+  All bookkeeping is version- and generation-scoped, so a late confirmation
+  can never leak into a successor's counters, and every accepted request is
+  settled exactly once (`accepted == completed + in_flight + unconfirmed`).
 * **The old process exits only after real work ends.** The drain loop stops and
-  reaps a `draining` process only when its in-flight count is zero. Just after
-  a 504 you will see the old version `draining` with `in_flight: 1`; the slot
-  is not reusable yet.
+  reaps a `draining` process only when its in-flight *and* unconfirmed counts
+  are zero. Just after a 504 you will see the old version `draining` with
+  `in_flight: 1`; just after a connection break, with `unconfirmed: 1`. In
+  both cases the slot is not reusable yet.
 * **A full machine refuses the third version, without touching the current
   one.** While both slots are occupied, uploads get 429 (after a short bounded
   wait for a drain that is already finishing). The active version is never
@@ -129,8 +144,17 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
    becomes active and the slow version goes `draining`. A third upload returns
    429 while the slow computation still runs. After it finishes the slot is
    released and the upload succeeds.
+4. **Connection break mid-inference.** `POST /infer` with
+   `{"features": [...], "slow_ms": 8000, "drop_response": true}`. The worker
+   accepts the request, drops the response connection, and keeps computing.
+   You get 502 `worker_connection_lost`; `/admin/status` shows
+   `unconfirmed: 1` (not `in_flight`). A swap uses the other slot and the old
+   process stays alive (`draining`); a third upload gets 429. When the
+   computation ends, the reconcile loop confirms it against the worker's own
+   in-flight table and the slot is released — no stuck slots, no double
+   counting.
 
-`python examples/demo.py <base-url>` runs all three end to end.
+`python examples/demo.py <base-url>` runs all four end to end.
 
 ## Observations from the smoke runs
 
@@ -138,6 +162,10 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
   itself is microseconds; this includes HTTP round trips).
 - After a 504, the drain gate held the slot for the full remaining computation
   (verified: 429 until the slow request finished, then `idle`).
+- After a forced API↔worker connection break (`drop_response`), the request
+  showed as `unconfirmed: 1`, the old process kept running until the worker's
+  own in-flight table no longer listed the request, and the slot was then
+  released automatically.
 - SIGTERM with an in-flight request: the request completed with 200, the API
   exited 0/-15 cleanly, and no worker processes remained.
 
@@ -166,5 +194,6 @@ examples/
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |
+| `UNCONFIRMED_GRACE_SECONDS` | `1` | registration grace before an unconfirmed request absent from the worker's table is confirmed finished |
 | `BOOTSTRAP_VERSION` / `BOOTSTRAP_MODEL` | unset | optionally load one artifact at startup |
 | `LOG_LEVEL` | `INFO` | logging |
